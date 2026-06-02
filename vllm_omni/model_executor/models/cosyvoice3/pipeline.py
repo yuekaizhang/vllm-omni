@@ -16,8 +16,16 @@ from vllm_omni.config.stage_config import (
     StageExecutionType,
     StagePipelineConfig,
 )
+from vllm_omni.model_executor.models.cosyvoice3.hf_talker_env import (
+    hf_metadata,
+    hf_talker_enabled,
+)
 
 _PROC = "vllm_omni.model_executor.stage_input_processors.cosyvoice3"
+
+# HF-Qwen2 talker (COSYVOICE3_HF_TALKER=1) emits a single eos token; the custom
+# fp32 talker merges 200 stop logits into 6562 via logsumexp in compute_logits.
+_TALKER_STOP_TOKEN_IDS = [hf_metadata()["eos_token_id"]] if hf_talker_enabled() else [6562]
 
 COSYVOICE3_PIPELINE = PipelineConfig(
     model_type="cosyvoice3",
@@ -32,8 +40,7 @@ COSYVOICE3_PIPELINE = PipelineConfig(
             engine_output_type="latent",
             async_chunk_process_next_stage_input_func=(f"{_PROC}.talker2code2wav_async_chunk"),
             sampling_constraints={
-                # merged speech stop token (logsumexp of all 200 stop logits)
-                "stop_token_ids": [6562],
+                "stop_token_ids": _TALKER_STOP_TOKEN_IDS,
             },
         ),
         StagePipelineConfig(

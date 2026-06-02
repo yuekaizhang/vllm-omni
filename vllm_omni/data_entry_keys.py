@@ -328,6 +328,13 @@ def _serialize_tensor(t: torch.Tensor) -> AdditionalInformationEntry:
     from vllm_omni.engine import AdditionalInformationEntry
 
     t_cpu = t.detach().to("cpu").contiguous()
+    # numpy has no bfloat16: upcast to float32 for the byte payload (the
+    # recorded dtype follows, so deserialize reconstructs float32). Needed when
+    # an upstream stage runs bf16 (e.g. the HF-Qwen2 talker), which makes vLLM
+    # cast the multimodal conditioning tensors to bf16 before they are emitted;
+    # the downstream code2wav stage consumes them in float32 regardless.
+    if t_cpu.dtype == torch.bfloat16:
+        t_cpu = t_cpu.float()
     return AdditionalInformationEntry(
         tensor_data=t_cpu.numpy().tobytes(),
         tensor_shape=list(t_cpu.shape),

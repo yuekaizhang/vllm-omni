@@ -33,6 +33,12 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.data_entry_keys import EmbeddingsStruct, OmniPayloadStruct, to_dict, to_struct
+from vllm_omni.model_executor.models.cosyvoice3.hf_talker_env import (
+    hf_metadata,
+    hf_talker_enabled,
+    hf_talker_path,
+    ras_enabled,
+)
 from vllm_omni.model_executor.models.cosyvoice3.utils import (
     concat_text_with_prompt_ids,
     extract_speech_feat,
@@ -108,6 +114,19 @@ class CosyVoice3MultiModalProcessor(BaseMultiModalProcessor[CosyVoice3MultiModal
             skip_special_tokens=config.skip_special_tokens,
             version=config.version,
         )
+        # HF-Qwen2 talker: build input_ids from the converted checkpoint's chat
+        # template (``<|sos|>{user}<|task_id|>{assistant}``) using its tokenizer,
+        # which knows the ``<|s_N|>`` codec tokens. See hf_talker_env.py.
+        self.hf_tokenizer = None
+        if hf_talker_enabled():
+            from transformers import AutoTokenizer
+
+            hf_path = hf_talker_path()
+            if not hf_path:
+                raise ValueError(
+                    "COSYVOICE3_HF_TALKER=1 requires COSYVOICE3_HF_TALKER_PATH=<hf_cosyvoice3_llm dir>"
+                )
+            self.hf_tokenizer = AutoTokenizer.from_pretrained(hf_path)
         self.speech_tokenizer = onnxruntime.InferenceSession(
             os.path.join(model_dir, config.speech_tokenizer_path),
             sess_options=option,
@@ -207,6 +226,28 @@ class CosyVoice3MultiModalProcessor(BaseMultiModalProcessor[CosyVoice3MultiModal
         speech_token_len = torch.tensor([n], dtype=torch.int32, device=return_device)
         return speech_token, speech_token_len
 
+    def _hf_build_input_ids(self, prompt_text, target_text) -> torch.Tensor:
+        """Build the HF talker text prompt via the converted chat template.
+
+        ``<|sos|>`` + (``"You are a helpful assistant.<|endofprompt|>"`` +
+        prompt_text + target_text) + ``<|task_id|>``. The prompt codec
+        (``<|s_N|>``) is appended as ``audio`` multimodal placeholders (see
+        ``_get_prompt_updates``) and filled by ``embed_multimodal`` with
+        ``embed_tokens(offset + speech_token)`` (== the ``<|s_N|>`` embeddings,
+        token id == offset + N) — reproducing poc_bf16_hf_llm.py's input
+        embeddings. Returns a ``[1, L]`` int32 tensor.
+        """
+        sys_prefix = "You are a helpful assistant.<|endofprompt|>"
+        pt = str(prompt_text)
+        # Callers (e.g. offline_benchmark's PROMPT_TEXT_PREFIX) may already embed
+        # the system instruction in prompt_text — don't duplicate it (a doubled
+        # prefix makes the talker generate wrong-content codec).
+        user = (pt if pt.startswith(sys_prefix) else sys_prefix + pt) + str(target_text)
+        ids = self.hf_tokenizer.apply_chat_template(
+            [{"role": "user", "content": user}], tokenize=True, return_tensors="pt"
+        )
+        return ids.to(torch.int32)
+
     def _call_hf_processor(
         self,
         prompt: str,
@@ -274,9 +315,12 @@ class CosyVoice3MultiModalProcessor(BaseMultiModalProcessor[CosyVoice3MultiModal
             )
             cached = self._speaker_cache.get(cache_key)
             if cached is not None:
+                cached_input_ids = input_ids
+                if self.hf_tokenizer is not None:
+                    cached_input_ids = self._hf_build_input_ids(prompt_text, prompt)
                 ft = BatchFeature(
                     {
-                        "input_ids": input_ids,
+                        "input_ids": cached_input_ids,
                         "speech_feat": cached["speech_feat"].clone(),
                         "speech_token": cached["speech_token"].clone(),
                         "speech_token_len": [cached["speech_token_len"].clone()],
@@ -367,6 +411,9 @@ class CosyVoice3MultiModalProcessor(BaseMultiModalProcessor[CosyVoice3MultiModal
                 },
             )
 
+        if self.hf_tokenizer is not None:
+            input_ids = self._hf_build_input_ids(prompt_text, prompt)
+
         ft = BatchFeature(
             {
                 "input_ids": input_ids,
@@ -406,6 +453,26 @@ class CosyVoice3MultiModalProcessor(BaseMultiModalProcessor[CosyVoice3MultiModal
         hf_processor_mm_kwargs: Mapping[str, object],
         out_mm_kwargs: MultiModalKwargsItems,
     ) -> Sequence[PromptUpdate]:
+        # HF talker: the prompt codec is INLINE in input_ids (real ``<|s_N|>``
+        # ids, embedded by embed_tokens just like plain vLLM). The single audio
+        # item still needs exactly one prompt-update, so self-replace the lone
+        # ``<|task_id|>`` token (sequence unchanged) and mark it as the one mm
+        # embed position — embed_multimodal returns its own embedding, so the
+        # scatter is a no-op. This avoids the bulk 195-row codec scatter.
+        if hf_talker_enabled():
+
+            def hf_insertion(item_idx):
+                token_len = out_mm_kwargs["audio"][item_idx]["speech_token_len"].data[0].item()
+                return [1] * int(token_len)
+
+            return [
+                PromptInsertion(
+                    modality="audio",
+                    target=PromptIndexTargets.end(),
+                    insertion=hf_insertion,
+                ),
+            ]
+
         def insertion_end(item_idx):
             # TODO: Think if this can be done better
             # sos + task + audio token ... ideally this needs to be split into
@@ -483,7 +550,13 @@ class CosyVoice3Model(
             model_dir = snapshot_download(model_dir)
         self.model_dir = model_dir
         self.model = None
-        if self.model_stage == "cosyvoice3_talker":
+        # Opt-in HF-Qwen2 talker (bf16). See hf_talker_env.py. Only affects the
+        # talker stage; code2wav is unchanged (it just maps generated ids back
+        # from the padded vocab in ``_sanitize_codec_tokens``).
+        self.hf_mode = hf_talker_enabled() and self.model_stage == "cosyvoice3_talker"
+        if self.model_stage == "cosyvoice3_talker" and self.hf_mode:
+            self._init_hf_talker(vllm_config)
+        elif self.model_stage == "cosyvoice3_talker":
             # Initialize talker stage (text to speech tokens)
             from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3_talker import CosyVoice3LM, VLLMQwen2Encoder
 
@@ -538,6 +611,74 @@ class CosyVoice3Model(
 
         # Use parent's cache config - critical for PagedAttention to work correctly
         return parent_config.with_hf_config(qwen_hf_config, architectures=["Qwen2Model"])
+
+    def _init_hf_talker(self, vllm_config: VllmConfig) -> None:
+        """Build the bf16 HF-Qwen2 talker (COSYVOICE3_HF_TALKER=1).
+
+        The folded checkpoint (``convert_cosyvoice3_to_hf.py``) is a vanilla
+        Qwen2 with ``speech_embedding`` merged into ``embed_tokens`` (padded
+        vocab) and ``llm_decoder`` merged into ``lm_head`` (text rows -inf in
+        the bias). So the inner LM is sized from the *HF* Qwen2 config (read
+        from ``COSYVOICE3_HF_TALKER_PATH``), not from the FunAudioLLM main model
+        — letting it run bf16 without the custom logsumexp / embed-rearrange.
+        ``self.config`` stays ``CosyVoice3Config`` (the multimodal processor and
+        code2wav depend on it).
+        """
+        from transformers import Qwen2Config
+
+        from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3_talker import VLLMQwen2Encoder
+
+        hf_path = hf_talker_path()
+        if not hf_path:
+            raise ValueError(
+                "COSYVOICE3_HF_TALKER=1 requires COSYVOICE3_HF_TALKER_PATH=<hf_cosyvoice3_llm dir>"
+            )
+        self.hf_talker_dir = hf_path
+        meta = hf_metadata()
+        self.hf_speech_token_offset = int(meta["speech_token_offset"])
+        self.hf_eos_token_id = int(meta["eos_token_id"])
+
+        qwen_hf_config = Qwen2Config.from_pretrained(hf_path)
+        llm_vllm_config = vllm_config.with_hf_config(qwen_hf_config, architectures=["Qwen2Model"])
+        self.hf_llm = VLLMQwen2Encoder(vllm_config=llm_vllm_config, prefix="model")
+        # Folded lm_head: a plain Linear (not ParallelLMHead) so the converted
+        # weight loads verbatim (TP=1). The checkpoint has no bias — after
+        # ``<|task_id|>`` + codec prompt the folded model already emits codec
+        # tokens (proven in poc_bf16_hf_llm.py); any stray text id is dropped by
+        # ``_sanitize_codec_tokens`` and stop is the single eos.
+        #
+        # Forced to fp32: a bf16 matmul over the 158720-wide vocab is numerically
+        # unstable enough to skew sampling (the bf16 talker degenerated into
+        # repetition / run-on, while fp32 logits match plain-vLLM behaviour).
+        # The model body still runs bf16; only the final projection is fp32.
+        self.hf_lm_head = nn.Linear(
+            qwen_hf_config.hidden_size, qwen_hf_config.vocab_size, bias=False
+        ).to(torch.float32)
+        self.model = self.hf_llm
+
+        # Per-layer output-norm hooks (COSYVOICE3_DEBUG_LAYERS=1, eager only) to
+        # locate where the bf16 forward diverges from fp32.
+        if os.environ.get("COSYVOICE3_DEBUG_LAYERS") == "1":
+            def _mk_hook(idx):
+                def _hook(mod, inp, out):
+                    h = out[0] if isinstance(out, (tuple, list)) else out
+                    r = out[1] if isinstance(out, (tuple, list)) and len(out) > 1 and torch.is_tensor(out[1]) else None
+                    logger.info(
+                        "[hf-layer] L%02d hid_norm=%.3f hid_max=%.3f%s n=%d",
+                        idx, float(h.float().norm()), float(h.float().abs().max()),
+                        ("" if r is None else " res_norm=%.3f" % float(r.float().norm())),
+                        int(h.shape[0]),
+                    )
+                return _hook
+            for i, layer in enumerate(self.hf_llm.model.layers):
+                layer.register_forward_hook(_mk_hook(i))
+        logger.info(
+            "CosyVoice3: HF-Qwen2 talker enabled (bf16-capable) — vocab=%d offset=%d eos=%d dir=%s",
+            qwen_hf_config.vocab_size,
+            self.hf_speech_token_offset,
+            self.hf_eos_token_id,
+            hf_path,
+        )
 
     @staticmethod
     def _cross_fade_audio(audio: torch.Tensor, prev_tail: torch.Tensor) -> torch.Tensor:
@@ -595,7 +736,26 @@ class CosyVoice3Model(
         return [ids]
 
     def _sanitize_codec_tokens(self, req_ids: torch.Tensor) -> torch.Tensor:
-        """Filter non-code tokens before feeding flow token embedding."""
+        """Filter non-code tokens before feeding flow token embedding.
+
+        HF talker (COSYVOICE3_HF_TALKER=1) generates ids in the padded vocab
+        (codec id N -> ``offset + N``; single eos), so shift back by the offset
+        first. ``offset`` lives on the (code2wav-stage) ``CosyVoice3Config`` set
+        globally when HF mode is on. The eos (offset + base_speech_token_size)
+        lands >= vocab_size and is dropped by the range filter below.
+        """
+        if hf_talker_enabled():
+            offset = int(getattr(self.config, "hf_speech_token_offset", hf_metadata()["speech_token_offset"]))
+            if os.environ.get("COSYVOICE3_DEBUG_TOKENS") == "1" and req_ids.numel() > 0:
+                logger.info(
+                    "[hf-debug] raw codec ids n=%d range=[%d,%d] first20=%s (offset=%d)",
+                    int(req_ids.numel()),
+                    int(req_ids.min().item()),
+                    int(req_ids.max().item()),
+                    req_ids[:20].tolist(),
+                    offset,
+                )
+            req_ids = req_ids - offset
         vocab_size = int(self.code2wav.input_embedding.num_embeddings)
         valid_mask = (req_ids >= 0) & (req_ids < vocab_size)
         return req_ids[valid_mask]
@@ -706,7 +866,9 @@ class CosyVoice3Model(
             sampler = Sampler()
             self._talker_sampler = sampler
 
-        if not self._cosyvoice3_ras_enabled(sampling_metadata):
+        # COSYVOICE3_RAS=0 forces vLLM's default sampling (for RAS-vs-default
+        # A/B). Default keeps the custom repetition-aware sampling.
+        if not ras_enabled() or not self._cosyvoice3_ras_enabled(sampling_metadata):
             return sampler(logits=logits, sampling_metadata=sampling_metadata)
 
         logits = logits.to(torch.float32)
@@ -753,6 +915,24 @@ class CosyVoice3Model(
     def compute_logits(self, hidden_states: torch.Tensor | OmniOutput) -> torch.Tensor | None:
         if isinstance(hidden_states, OmniOutput):
             hidden_states = hidden_states.text_hidden_states
+        if self.model_stage == "cosyvoice3_talker" and self.hf_mode:
+            # Folded vanilla Qwen2 lm_head over the padded vocab. Stop is a
+            # single eos token, so NO logsumexp merge / NO padding is needed.
+            logits = self.hf_lm_head(hidden_states.to(self.hf_lm_head.weight.dtype))
+            if os.environ.get("COSYVOICE3_DEBUG_TOKENS") == "1" and not getattr(self, "_hf_logit_dbg", False):
+                self._hf_logit_dbg = True
+                row = logits.reshape(-1, logits.shape[-1])[0]
+                top = torch.topk(row, 8)
+                logger.info(
+                    "[hf-debug] compute_logits row0 shape=%s lm_head.w[mean=%.4f std=%.4f dev=%s dtype=%s] "
+                    "hidden[mean=%.4f std=%.4f] top8_ids=%s top8_val=%s",
+                    tuple(logits.shape),
+                    float(self.hf_lm_head.weight.mean()), float(self.hf_lm_head.weight.std()),
+                    str(self.hf_lm_head.weight.device), str(self.hf_lm_head.weight.dtype),
+                    float(hidden_states.float().mean()), float(hidden_states.float().std()),
+                    top.indices.tolist(), [round(v, 3) for v in top.values.tolist()],
+                )
+            return logits
         if self.model_stage == "cosyvoice3_talker":
             logits = self.model.llm_decoder(hidden_states)
             # The decoder outputs speech_token_size + 200 logits.  The official
@@ -778,6 +958,18 @@ class CosyVoice3Model(
             raise RuntimeError(f"compute_logits is only valid for {self.model_stage}.")
 
     def embed_multimodal(self, **kwargs: object):
+        if self.model_stage == "cosyvoice3_talker" and self.hf_mode:
+            # HF talker: the prompt codec placeholders are filled with the
+            # merged ``embed_tokens`` at the offset codec ids — i.e. the
+            # embedding of the ``<|s_N|>`` tokens (token id == offset + N). The
+            # raw 0-based ``speech_token`` is still emitted to code2wav from
+            # forward() kwargs. Mirror the per-item list handling at batch>1.
+            speech_token = kwargs["speech_token"]
+            embed = self.hf_llm.model.embed_tokens
+            offset = self.hf_speech_token_offset
+            if isinstance(speech_token, (list, tuple)):
+                return [embed((t.long() + offset)).reshape(t.shape[-1], -1) for t in speech_token]
+            return embed(speech_token.long() + offset)
         if self.model_stage == "cosyvoice3_talker":
             speech_token = kwargs["speech_token"]
             # vLLM's _execute_mm_encoder batches ALL multimodal items scheduled
@@ -801,6 +993,41 @@ class CosyVoice3Model(
         multimodal_embeddings=None,
         is_multimodal=None,
     ) -> torch.Tensor:
+        if self.model_stage == "cosyvoice3_talker" and self.hf_mode:
+            # Vanilla Qwen2 embedding. Generated/decode codec tokens are real
+            # ids in the padded vocab (embedded directly). At prefill, the
+            # trailing audio placeholders are overwritten with the prompt codec
+            # embeddings produced by embed_multimodal (one [T_i, H] tensor per
+            # request, in request order — see its list-handling note).
+            emb = self.hf_llm.model.embed_tokens(input_ids)
+            has_mm = is_multimodal is not None and (
+                bool(is_multimodal.any()) if torch.is_tensor(is_multimodal) else any(is_multimodal)
+            )
+            if multimodal_embeddings is not None and has_mm:
+                is_mm = is_multimodal.to(torch.bool).reshape(-1)
+                if isinstance(multimodal_embeddings, (list, tuple)):
+                    mm = torch.cat([m.reshape(-1, m.shape[-1]) for m in multimodal_embeddings], dim=0)
+                else:
+                    mm = multimodal_embeddings.reshape(-1, multimodal_embeddings.shape[-1])
+                if os.environ.get("COSYVOICE3_DEBUG_TOKENS") == "1":
+                    logger.info(
+                        "[hf-debug] embed_input_ids: total=%d is_mm=%d mm_rows=%d input_ids[:6]=%s input_ids[-6:]=%s",
+                        int(input_ids.numel()),
+                        int(is_mm.sum().item()),
+                        int(mm.shape[0]),
+                        input_ids.reshape(-1)[:6].tolist(),
+                        input_ids.reshape(-1)[-6:].tolist(),
+                    )
+                emb[is_mm] = mm.to(emb.dtype)
+            if os.environ.get("COSYVOICE3_DEBUG_TOKENS") == "1":
+                logger.info(
+                    "[hf-emb] n=%d emb_norm=%.3f per_tok=%.3f ids[:4]=%s",
+                    int(input_ids.numel()),
+                    float(emb.float().norm()),
+                    float(emb.float().norm()) / max(1.0, float(input_ids.numel()) ** 0.5),
+                    input_ids.reshape(-1)[:4].tolist(),
+                )
+            return emb
         if self.model_stage == "cosyvoice3_talker":
             if is_multimodal is not None and any(is_multimodal):
                 # Per-request rearrange for the talker prompt layout
@@ -972,7 +1199,30 @@ class CosyVoice3Model(
         if getattr(self, "_code2wav_trt_done", False):
             return
         self._code2wav_trt_done = True
-        if not (_cosyvoice3_trt_enabled() and torch.cuda.is_available()):
+        if not torch.cuda.is_available():
+            return
+
+        # Alternative flow-estimator backend: CUDA-graph the torch DiT instead
+        # of TensorRT (COSYVOICE3_FLOW_CUDAGRAPH=1). Independent of the spk-emb
+        # COSYVOICE3_TRT toggle. The wrapper stays an nn.Module so
+        # CausalConditionalCFM.forward_estimator calls it directly.
+        from vllm_omni.model_executor.models.cosyvoice3.flow_estimator_cudagraph import (
+            CudaGraphDiTEstimator,
+            flow_cudagraph_enabled,
+        )
+
+        if flow_cudagraph_enabled():
+            try:
+                decoder = self.code2wav.flow_model.decoder
+                decoder.estimator = CudaGraphDiTEstimator(decoder.estimator)
+                logger.info("CosyVoice3: using CUDA-graph torch flow-decoder estimator (code2wav)")
+            except Exception as exc:  # pragma: no cover - defensive fallback
+                logger.warning(
+                    "CosyVoice3 code2wav: CUDA-graph estimator setup failed (%s); keeping torch estimator", exc
+                )
+            return
+
+        if not _cosyvoice3_trt_enabled():
             return
         onnx_path = self._resolve_flow_estimator_onnx()
         if onnx_path is None:
@@ -1011,7 +1261,24 @@ class CosyVoice3Model(
                 inputs_embeds = self.embed_input_ids(input_ids)
 
             # [total_tokens, hidden]
-            hidden_states = self.model.llm(inputs_embeds, positions)
+            if self.hf_mode:
+                hidden_states = self.hf_llm(inputs_embeds, positions)
+            else:
+                hidden_states = self.model.llm(inputs_embeds, positions)
+
+            if self.hf_mode and os.environ.get("COSYVOICE3_DEBUG_TOKENS") == "1":
+                ie = inputs_embeds
+                hs = hidden_states
+                logger.info(
+                    "[hf-fwd] in_ids=%s pos=[%s..%s] ie%s nan=%d inf=%d norm=%.3f | "
+                    "hid%s nan=%d inf=%d norm=%.3f last_norm=%.3f",
+                    tuple(input_ids.shape) if input_ids is not None else None,
+                    int(positions.reshape(-1)[0]), int(positions.reshape(-1)[-1]),
+                    tuple(ie.shape), int(torch.isnan(ie).sum()), int(torch.isinf(ie).sum()),
+                    float(ie.float().norm()),
+                    tuple(hs.shape), int(torch.isnan(hs).sum()), int(torch.isinf(hs).sum()),
+                    float(hs.float().norm()), float(hs.float()[-1].norm()),
+                )
 
             multimodal_outputs = {}
 
@@ -1172,7 +1439,58 @@ class CosyVoice3Model(
         else:
             raise ValueError(f"Unsupported model_stage: {self.model_stage}")
 
+    def _load_hf_talker_weights(self) -> set[str]:
+        """Load the folded HF-Qwen2 talker (``model.safetensors``).
+
+        ``model.*`` -> vLLM ``Qwen2Model`` (handles q/k/v -> qkv_proj,
+        gate/up -> gate_up_proj stacking). ``lm_head.{weight,bias}`` -> the
+        folded Linear (the bias carries the -inf text mask).
+        """
+        from safetensors.torch import load_file
+
+        device = next(self.hf_llm.parameters()).device
+        st_path = os.path.join(self.hf_talker_dir, "model.safetensors")
+        if not os.path.exists(st_path):
+            raise FileNotFoundError(f"HF talker weights not found: {st_path}")
+        state = load_file(st_path)
+
+        qwen_weights = [
+            (name[len("model.") :], w) for name, w in state.items() if name.startswith("model.")
+        ]
+        loaded = self.hf_llm.model.load_weights(iter(qwen_weights))
+
+        lm_dtype = self.hf_lm_head.weight.dtype
+        with torch.no_grad():
+            self.hf_lm_head.weight.copy_(state["lm_head.weight"].to(device=device, dtype=lm_dtype))
+        self.hf_lm_head.to(device)
+        # Sanity: compare loaded embed_tokens codec-row norm to the checkpoint
+        # (should match; a mismatch means the embedding load inflated values).
+        with torch.no_grad():
+            ew = self.hf_llm.model.embed_tokens.weight
+            off = self.hf_speech_token_offset
+            codec_rows = ew[off : off + 100].float()
+            ck = state["model.embed_tokens.weight"][off : off + 100].float()
+            logger.info(
+                "CosyVoice3 HF talker: loaded %d/%d Qwen2 tensors + lm_head from %s | "
+                "embed_tokens loaded codec-row-norm mean=%.3f vs ckpt mean=%.3f (shape %s vs %s)",
+                len(loaded) if loaded else 0,
+                len(qwen_weights),
+                st_path,
+                float(codec_rows.norm(dim=1).mean()),
+                float(ck.norm(dim=1).mean()),
+                tuple(ew.shape),
+                tuple(state["model.embed_tokens.weight"].shape),
+            )
+        # Return the FULL-name loaded set (Qwen2Model.load_weights yields names
+        # relative to itself) so vLLM's "weights not initialized" completeness
+        # check matches ``named_parameters`` (hf_llm.model.* + hf_lm_head.*).
+        loaded_full = {f"hf_llm.model.{n}" for n in (loaded or [])}
+        loaded_full.add("hf_lm_head.weight")
+        return loaded_full
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        if self.model_stage == "cosyvoice3_talker" and self.hf_mode:
+            return self._load_hf_talker_weights()
         if self.model_stage == "cosyvoice3_talker":
             # Load weights for text to speech LM stage using vLLM's weight loading
             llm_weight_path = os.path.join(self.model_dir, "llm.pt")

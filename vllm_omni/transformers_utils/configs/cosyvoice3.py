@@ -23,6 +23,21 @@ class CosyVoice3Config(PretrainedConfig):
         self.token_frame_rate = 25
         self.token_mel_ratio = 2
         self.vocab_size = 151923
+        # Opt-in HF-Qwen2 talker (bf16): the folded checkpoint generates ids in
+        # the padded vocab (codec id N -> token id offset+N, single eos), so the
+        # engine's vocab / stop token must match the padded HF vocab. Custom
+        # fp32 path keeps vocab_size=151923 and merged-stop logsumexp.
+        from vllm_omni.model_executor.models.cosyvoice3.hf_talker_env import (
+            hf_metadata,
+            hf_talker_enabled,
+        )
+
+        if hf_talker_enabled():
+            meta = hf_metadata()
+            self.vocab_size = meta["padded_vocab_size"]
+            self.hf_speech_token_offset = meta["speech_token_offset"]
+            self.hf_eos_token_id = meta["eos_token_id"]
+            self.hf_base_speech_token_size = meta["base_speech_token_size"]
         self.min_token_text_ratio = 2
         self.max_token_text_ratio = 20
         self.allowed_special = "all"

@@ -33,10 +33,21 @@ connectors:
           #   Base ref-context first/steady chunks: 73 / 169 frames
           #   decoder internal non-streaming chunks: 325 frames
       decode_cudagraph_capture_sizes: [25, 73, 97, 169, 325]
+      # TensorRT codec decoder (default on; falls back to the cudagraph/torch
+      # path if no engine is found, so it is safe to leave enabled). Point at a
+      # prebuilt engine via env QWEN3_TTS_CODEC_PLAN, or an ONNX via
+      # QWEN3_TTS_CODEC_ONNX (built+cached on first load); set QWEN3_TTS_CODEC_TRT=0
+      # to force off. Build the engine with scripts/export_codec_{onnx,trt}.py.
+      # The engine frame size F0 should match the streaming window
+      # codec_chunk_frames + codec_left_context_frames (= 97 here); larger chunks
+      # (e.g. non-streaming) fall back to torch. F0=97 gives the big online wins
+      # (conc=8: TTFP mean -57% / p99 -84%, throughput +13%, RTF -14%); offline
+      # batch is talker-bound so end-to-end is ~flat there.
+      decode_enable_trt: true
 
 stages:
   - stage_id: 0
-    max_num_seqs: 10
+    max_num_seqs: 32
     gpu_memory_utilization: 0.3
     trust_remote_code: true
     # Prefix caching on by default. The HS opt-out (talker only consumes the
@@ -65,7 +76,7 @@ stages:
 
   - stage_id: 1
     # Tuned for Base voice clone; CustomVoice / VoiceDesign are TTFA-optimal at 1.
-    max_num_seqs: 10
+    max_num_seqs: 32
     gpu_memory_utilization: 0.3
     enforce_eager: false
     trust_remote_code: true

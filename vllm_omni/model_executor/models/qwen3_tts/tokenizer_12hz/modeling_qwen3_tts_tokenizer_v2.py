@@ -856,6 +856,11 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         self._cudagraph_enabled = False
         self._cudagraph_wrapper = None
 
+        # TensorRT support (mutually exclusive with CUDA Graph: both replace the
+        # inner forward net).
+        self._trt_enabled = False
+        self._trt_engine = None
+
     def precompute_snake_caches(self):
         """Precompute exp(alpha) and 1/(exp(beta)+eps) for all SnakeBeta modules."""
         count = 0
@@ -880,6 +885,9 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
     ):
         from ..cuda_graph_decoder_wrapper import CUDAGraphDecoderWrapper
 
+        if self._trt_enabled:
+            logger.warning("Refusing to enable CUDA Graph: TensorRT already enabled for decoder")
+            return
         if device is None:
             device = next(self.parameters()).device
         if device.type != "cuda":
@@ -917,7 +925,69 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         self._cudagraph_wrapper = None
         logger.info("CUDA Graph disabled for decoder")
 
+    def enable_trt(self, *, device=None, onnx_path=None, plan_path=None, warmup_sizes=None, warmup_batches=(1,)):
+        """Swap the inner forward net for a TensorRT engine.
+
+        Mutually exclusive with CUDA Graph (both replace ``forward``); refuses if
+        CUDA Graph is already enabled. The engine is built from ``onnx_path``
+        (cached) or deserialized from a prebuilt ``plan_path``.
+
+        ``warmup_sizes`` pre-runs the **torch** decoder at those chunk-frame sizes
+        so its cuDNN/conv workspaces are allocated up front. This is required
+        because the torch path is the fallback used when an outer CUDA-graph
+        stream capture is active (where allocation is illegal), and — unlike the
+        CUDA-graph path — nothing else warms it when TRT is on.
+        """
+        from ..codec_trt import get_codec_decoder_trt
+
+        if self._cudagraph_enabled:
+            logger.warning("Refusing to enable TRT: CUDA Graph already enabled for decoder")
+            return
+        if device is None:
+            device = next(self.parameters()).device
+        device = torch.device(device)
+        if device.type != "cuda":
+            logger.warning("Cannot enable TRT: decoder is not on a CUDA device (got %s)", device)
+            return
+
+        self._trt_engine = get_codec_decoder_trt(
+            device=device,
+            num_quantizers=int(self.config.num_quantizers),
+            total_upsample=int(self.total_upsample),
+            torch_forward=self._forward_torch,
+            onnx_path=onnx_path,
+            plan_path=plan_path,
+        )
+        self._trt_enabled = True
+
+        if warmup_sizes:
+            nq = int(self.config.num_quantizers)
+            with torch.inference_mode():
+                for bs in warmup_batches:
+                    for size in warmup_sizes:
+                        if size <= 0 or bs <= 0:
+                            continue
+                        dummy = torch.zeros(int(bs), nq, int(size), dtype=torch.long, device=device)
+                        self._forward_torch(dummy)
+            torch.accelerator.synchronize(device)
+            logger.info(
+                "Warmed torch decoder fallback at sizes=%s batches=%s (cuDNN workspaces preallocated)",
+                list(warmup_sizes),
+                list(warmup_batches),
+            )
+        logger.info("TensorRT enabled for Qwen3-TTS codec decoder")
+
+    def disable_trt(self):
+        self._trt_enabled = False
+        self._trt_engine = None
+        logger.info("TensorRT disabled for decoder")
+
     def forward(self, codes):
+        if self._trt_enabled and self._trt_engine is not None:
+            return self._trt_engine(codes)
+        return self._forward_torch(codes)
+
+    def _forward_torch(self, codes):
         if codes.shape[1] != self.config.num_quantizers:
             raise ValueError(f"Expected {self.config.num_quantizers} layer of codes, got {codes.shape[1]}")
 

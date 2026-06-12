@@ -189,6 +189,87 @@ class Qwen3TTSCode2Wav(nn.Module):
         )
         logger.info("Code2Wav decoder CUDA Graph enabled")
 
+    def _resolve_codec_trt_paths(self) -> tuple[str | None, str | None]:
+        """Resolve (onnx_path, plan_path) for the codec TRT engine.
+
+        The engine artifact is large and deploy-specific, so it is configured via
+        env (the Code2Wav stage worker inherits the launching shell's env):
+        ``QWEN3_TTS_CODEC_PLAN`` (prebuilt engine, takes priority) or
+        ``QWEN3_TTS_CODEC_ONNX``; else fall back to ``codec.onnx`` co-located with
+        the decoder weights under ``speech_tokenizer/``.
+        """
+        plan_path = os.environ.get("QWEN3_TTS_CODEC_PLAN") or None
+        if plan_path:
+            if os.path.exists(plan_path):
+                return None, plan_path
+            logger.warning("QWEN3_TTS_CODEC_PLAN=%s does not exist; ignoring", plan_path)
+
+        onnx_path = os.environ.get("QWEN3_TTS_CODEC_ONNX") or None
+        if onnx_path:
+            if os.path.exists(onnx_path):
+                return onnx_path, None
+            logger.warning("QWEN3_TTS_CODEC_ONNX=%s does not exist; ignoring", onnx_path)
+
+        default_onnx = os.path.join(self.model_path, "speech_tokenizer", "codec.onnx")
+        if os.path.exists(default_onnx):
+            return default_onnx, None
+        return None, None
+
+    def _maybe_enable_decoder_trt(
+        self,
+        *,
+        device: torch.device,
+        enabled: bool,
+        warmup_sizes: list[int] | None = None,
+    ) -> bool:
+        """Enable the codec TensorRT engine. Returns True if it took effect.
+
+        Mutually exclusive with CUDA Graph (caller enables CUDA Graph only when
+        this returns False).
+        """
+        from .codec_trt import _codec_trt_enabled
+
+        if not enabled or not _codec_trt_enabled():
+            return False
+        if device.type != "cuda" or not hasattr(self.decoder, "enable_trt"):
+            return False
+
+        model_cfg = getattr(self.vllm_config, "model_config", None)
+        if getattr(model_cfg, "enforce_eager", False):
+            # enforce_eager only gates CUDA Graph capture; TRT has its own engine
+            # so it is still allowed, but respect the intent of a pure-eager run.
+            logger.info("Qwen3-TTS Code2Wav: enforce_eager set; skipping codec TensorRT")
+            return False
+
+        onnx_path, plan_path = self._resolve_codec_trt_paths()
+        if onnx_path is None and plan_path is None:
+            logger.info(
+                "Qwen3-TTS codec TensorRT requested but no engine/onnx found "
+                "(set QWEN3_TTS_CODEC_PLAN or QWEN3_TTS_CODEC_ONNX); using torch/cudagraph path"
+            )
+            return False
+
+        # Pre-warm the torch fallback at the same chunk-frame sizes the CUDA-graph
+        # path would capture, so cuDNN workspaces are allocated before any outer
+        # stream capture (where the fallback runs but allocation is illegal).
+        if not warmup_sizes:
+            from .cuda_graph_decoder_wrapper import CUDAGraphDecoderWrapper
+
+            warmup_sizes = CUDAGraphDecoderWrapper.compute_capture_sizes(
+                decode_chunk_size=self._decode_chunk_frames,
+                decode_left_context=self._decode_left_context_frames,
+            )
+        warmup_batches = sorted({1, 2, 4, min(8, self._decode_batch_max_size or 8)})
+
+        self.decoder.enable_trt(
+            device=device,
+            onnx_path=onnx_path,
+            plan_path=plan_path,
+            warmup_sizes=warmup_sizes,
+            warmup_batches=warmup_batches,
+        )
+        return bool(getattr(self.decoder, "_trt_enabled", False))
+
     def _get_decode_batch_bucket_frames(self, actual_frames: int) -> int:
         for bucket_frames in self._decode_batch_bucket_frames:
             if actual_frames <= bucket_frames:
@@ -742,12 +823,14 @@ class Qwen3TTSCode2Wav(nn.Module):
                 )
             self._decode_variable_chunk_batch_min_frames = decode_variable_chunk_batch_min_frames
             decode_enable_tf32 = _get_bool_config("decode_enable_tf32", False)
+            decode_enable_trt = _get_bool_config("decode_enable_trt", True)
         else:
             decode_cudagraph_capture_sizes = None
             decode_cudagraph_batch_sizes = None
             decode_cudagraph_extra_capture_shapes = None
             decode_compile_shapes = None
             decode_enable_tf32 = False
+            decode_enable_trt = True
 
         if decode_enable_tf32 and device.type == "cuda":
             # PyTorch exposes TF32 controls as process-wide CUDA backend
@@ -764,7 +847,24 @@ class Qwen3TTSCode2Wav(nn.Module):
                 torch.get_float32_matmul_precision(),
             )
 
-        if hasattr(self.decoder, "enable_cudagraph") and device.type == "cuda":
+        # TensorRT and CUDA Graph both replace the inner decoder forward, so they
+        # are mutually exclusive. Attempt TRT first; only fall back to CUDA Graph
+        # (whose warmup captures the torch forward) if TRT did not take effect.
+        trt_enabled = False
+        if device.type == "cuda":
+            try:
+                trt_enabled = self._maybe_enable_decoder_trt(
+                    device=device,
+                    enabled=decode_enable_trt,
+                    warmup_sizes=decode_cudagraph_capture_sizes,
+                )
+            except Exception:
+                logger.warning(
+                    "Failed to enable TensorRT for Code2Wav decoder; falling back",
+                    exc_info=True,
+                )
+
+        if not trt_enabled and hasattr(self.decoder, "enable_cudagraph") and device.type == "cuda":
             try:
                 self._maybe_enable_decoder_cudagraph(
                     device=device,

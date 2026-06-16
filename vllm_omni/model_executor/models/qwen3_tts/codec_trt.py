@@ -148,24 +148,36 @@ class CodecDecoderTRT:
         self.input_dtype = _trt_dtype_to_torch(engine.get_tensor_dtype(self.input_name))
         self.output_dtype = _trt_dtype_to_torch(engine.get_tensor_dtype(self.output_name))
 
-        # The frames axis is baked static in the ONNX (F0); only batch is dynamic.
-        # input shape is [batch, F0, Q]. The runtime right-pads each chunk up to
-        # F0 and slices the output back (causal convs make right-padding safe).
+        # Two engine kinds:
+        #  * dynamic-frames (dynamo export): input [batch, -1, Q]; run at native
+        #    frame count, no padding. `frame_size` = the profile's max frames
+        #    (chunks beyond it fall back to torch).
+        #  * fixed-frames (legacy F0): input [batch, F0, Q]; right-pad each chunk
+        #    up to F0 and slice the output back (causal convs make this safe).
         in_shape = engine.get_tensor_shape(self.input_name)
-        self.frame_size = int(in_shape[1])
-        if self.frame_size <= 0:
-            raise RuntimeError(
-                f"Codec TRT engine {source} has non-static frames dim {in_shape}; re-export with a fixed --frames"
-            )
+        fdim = int(in_shape[1])
+        self.dynamic_frames = fdim <= 0
+        if self.dynamic_frames:
+            try:
+                _mn, _opt, _mx = engine.get_tensor_profile_shape(self.input_name, 0)
+                self.frame_size = int(_mx[1])
+                self.min_frames = int(_mn[1])
+            except Exception:
+                self.frame_size = _max_profile_frames()
+                self.min_frames = 1
+        else:
+            self.frame_size = fdim
+            self.min_frames = 1  # any f in [1, F0] is right-padded up to F0
 
         self.pool = TrtContextPool(engine, device=self.device, concurrency=_trt_concurrency())
         logger.info(
-            "Loaded Qwen3-TTS codec TensorRT engine (%s): in=%s[%s] out=%s[%s] F0=%d concurrency=%d",
+            "Loaded Qwen3-TTS codec TensorRT engine (%s): in=%s[%s] out=%s[%s] frames=%s(max=%d) concurrency=%d",
             source,
             self.input_name,
             self.input_dtype,
             self.output_name,
             self.output_dtype,
+            "dynamic" if self.dynamic_frames else "fixed",
             self.frame_size,
             _trt_concurrency(),
         )
@@ -181,23 +193,29 @@ class CodecDecoderTRT:
         if codes.shape[1] != self.num_quantizers:
             raise ValueError(f"Expected {self.num_quantizers} layers of codes, got {codes.shape[1]}")
 
+        orig_codes = codes
         b = int(codes.shape[0])
         f = int(codes.shape[2])
-        # The engine's frames dim is fixed at F0. A larger chunk can't run on this
-        # engine; fall back to the torch decoder (rare — F0 covers the max chunk).
-        if f > self.frame_size:
+        # Chunks outside the engine's supported frame range fall back to the torch
+        # decoder: above the profile max (rare; size tuned to the streaming window),
+        # or — for a dynamic engine — below the profile min (the tiny initial/ramp
+        # streaming chunks). A profile violation otherwise corrupts execution.
+        if f > self.frame_size or f < self.min_frames:
             return self._torch_forward(codes)
 
-        # Right-pad the codes up to F0 (causal convs => the first f*upsample output
-        # samples are unaffected by the trailing zero frames), then slice back.
-        if f < self.frame_size:
-            padded = codes.new_zeros((b, self.num_quantizers, self.frame_size))
-            padded[:, :, :f] = codes
-            codes = padded
-        # [B, Q, F0] -> [B, F0, Q] to match the exported ONNX input.
+        if self.dynamic_frames:
+            run_frames = f  # run at native length, no padding
+        else:
+            # Right-pad up to F0 (causal convs => the first f*upsample output
+            # samples are unaffected by the trailing zero frames); slice back below.
+            run_frames = self.frame_size
+            if f < self.frame_size:
+                padded = codes.new_zeros((b, self.num_quantizers, self.frame_size))
+                padded[:, :, :f] = codes
+                codes = padded
+        # [B, Q, run_frames] -> [B, run_frames, Q] to match the exported ONNX input.
         x = codes.transpose(1, 2).contiguous().to(self.device, dtype=self.input_dtype)
-        full_len = self.frame_size * self.total_upsample
-        out = torch.empty((b, full_len), device=self.device, dtype=self.output_dtype)
+        out = torch.empty((b, run_frames * self.total_upsample), device=self.device, dtype=self.output_dtype)
 
         # Execute on the CURRENT stream so the engine is correctly ordered after
         # the torch ops that produced `x` and before the caller reads `out` — all
@@ -208,7 +226,11 @@ class CodecDecoderTRT:
         stream = torch.cuda.current_stream(self.device)
         ctx = self.pool.acquire()
         try:
-            ctx.set_input_shape(self.input_name, tuple(x.shape))
+            # A failed set_input_shape (e.g. shape outside the profile) must NOT be
+            # followed by execute — that reads stale bindings and corrupts the
+            # device (illegal memory access). Fall back to torch instead.
+            if not ctx.set_input_shape(self.input_name, tuple(x.shape)):
+                return self._torch_forward(orig_codes)
             ctx.set_tensor_address(self.input_name, x.data_ptr())
             ctx.set_tensor_address(self.output_name, out.data_ptr())
             if not ctx.execute_async_v3(stream.cuda_stream):

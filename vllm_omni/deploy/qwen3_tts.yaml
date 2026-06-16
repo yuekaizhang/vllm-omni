@@ -37,12 +37,17 @@ connectors:
       # path if no engine is found, so it is safe to leave enabled). Point at a
       # prebuilt engine via env QWEN3_TTS_CODEC_PLAN, or an ONNX via
       # QWEN3_TTS_CODEC_ONNX (built+cached on first load); set QWEN3_TTS_CODEC_TRT=0
-      # to force off. Build the engine with scripts/export_codec_{onnx,trt}.py.
-      # The engine frame size F0 should match the streaming window
-      # codec_chunk_frames + codec_left_context_frames (= 97 here); larger chunks
-      # (e.g. non-streaming) fall back to torch. F0=97 gives the big online wins
-      # (conc=8: TTFP mean -57% / p99 -84%, throughput +13%, RTF -14%); offline
-      # batch is talker-bound so end-to-end is ~flat there.
+      # to force off. Build with scripts/export_codec_{onnx,trt}.py.
+      #
+      # Prefer a DYNAMIC-frames engine (one engine handles any chunk length):
+      #   export_codec_onnx.py --dynamic --dtype fp16
+      #   export_codec_trt.py  --fusion-barrier --frames-profile 1 169 360
+      # Out-of-profile chunks fall back to torch. A dynamic engine beats the
+      # cudagraph baseline across the board and grows with load (same-session
+      # H100, conc=16: throughput +18%, RTF -15%, E2EL -15%, TTFP mean -17%).
+      # A fixed-F0 engine (default --frames in export_codec_onnx.py) also works
+      # but a too-small F0 sends Base ref-context chunks (~169) to torch and
+      # spikes p99 TTFP under load; the dynamic engine avoids that.
       decode_enable_trt: true
 
 stages:

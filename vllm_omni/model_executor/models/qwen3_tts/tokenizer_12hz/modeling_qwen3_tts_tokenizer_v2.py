@@ -14,7 +14,6 @@
 """PyTorch Qwen3TTSTokenizerV2 model."""
 
 import inspect
-import math
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -198,20 +197,26 @@ class Qwen3TTSTokenizerV2CausalConvNet(nn.Module):
         self.padding = self.kernel_size - self.stride
 
     def _get_extra_padding_for_conv1d(self, hidden_state: torch.Tensor) -> int:
-        # Cache the result per input length — under cudagraph capture the set of lengths
-        # is fixed, so the LUT converges quickly and replaces the math.ceil call per replay.
+        # Integer-only ceil (no float / math.ceil), so this stays symbolic under the
+        # dynamo ONNX exporter and a dynamic frames axis generalizes (math.ceil on a
+        # shape-derived value bakes the length into the traced graph). Numerically
+        # identical to ceil((L-K+P)/S)+1 for the eager path. A python-int length
+        # (eager / cudagraph capture) is cached; a SymInt (tracing) skips the cache.
         length = hidden_state.shape[-1]
-        cache = self.__dict__.get("_pad_lut")
-        if cache is None:
-            cache = {}
-            self.__dict__["_pad_lut"] = cache
-        cached = cache.get(length)
-        if cached is not None:
-            return cached
-        n_frames = (length - self.kernel_size + self.padding) / self.stride + 1
-        ideal_length = (math.ceil(n_frames) - 1) * self.stride + (self.kernel_size - self.padding)
-        extra_padding = ideal_length - length
-        cache[length] = extra_padding
+        is_static = isinstance(length, int)
+        if is_static:
+            cache = self.__dict__.get("_pad_lut")
+            if cache is None:
+                cache = {}
+                self.__dict__["_pad_lut"] = cache
+            cached = cache.get(length)
+            if cached is not None:
+                return cached
+        num = length - self.kernel_size + self.padding
+        n_frames_ceil = (num + self.stride - 1) // self.stride + 1  # == ceil(num/stride)+1
+        extra_padding = (n_frames_ceil - 1) * self.stride + (self.kernel_size - self.padding) - length
+        if is_static:
+            cache[length] = extra_padding
         return extra_padding
 
     def forward(self, hidden_state):

@@ -51,16 +51,19 @@ def _make_add_zero_barrier(tensor, zero_var, name):
     return add, new_tensor
 
 
-def _find_target_transpose(graph, named_tensor):
-    """Locate the post-transformer permute node to wrap.
+def _find_target_transposes(graph, named_tensor):
+    """Return the permute node(s) to wrap.
 
-    Prefer the explicitly named output tensor; otherwise pick, among Transpose
-    nodes with perm==[0,2,1], the one whose output is consumed by a Conv /
-    ConvTranspose (the entry to the upsample/decoder stack).
+    If ``named_tensor`` is found, wrap just that. Otherwise wrap ALL Transpose
+    nodes with perm==[0,2,1] whose output feeds a Conv/ConvTranspose (the entry
+    to the upsample/decoder stack). The dynamo exporter renames nodes and may
+    expose more than one such permute; the barrier is an identity ``Add(x, 0)``,
+    so wrapping every candidate is harmless and guarantees the one TRT mis-fuses
+    at dynamic batch > 1 is covered.
     """
     by_name = [n for n in graph.nodes for o in n.outputs if o.name == named_tensor]
     if by_name:
-        return by_name[0]
+        return by_name
 
     consumers: dict[str, list] = {}
     for node in graph.nodes:
@@ -74,8 +77,7 @@ def _find_target_transpose(graph, named_tensor):
         perm = node.attrs.get("perm")
         if perm is not None and list(perm) != [0, 2, 1]:
             continue
-        out_name = node.outputs[0].name
-        downstream = consumers.get(out_name, [])
+        downstream = consumers.get(node.outputs[0].name, [])
         if any(c.op in ("Conv", "ConvTranspose") for c in downstream):
             candidates.append(node)
 
@@ -85,26 +87,10 @@ def _find_target_transpose(graph, named_tensor):
             f"Could not locate the post-transformer Transpose (named {named_tensor!r} not found, "
             f"no [0,2,1] Transpose feeds a Conv). Transpose nodes present: {all_tp}"
         )
-    if len(candidates) > 1:
-        print(
-            f"  [warn] {len(candidates)} candidate Transpose nodes feed a Conv: {[c.name for c in candidates]}; using the first"
-        )
-    return candidates[0]
+    return candidates
 
 
-def apply_trt_fusion_barrier(onnx_path, target_tensor_name):
-    """Wrap the post-transformer permute with ``Add(x, runtime_zero)`` barriers."""
-    model = onnx.load(str(onnx_path))
-    try:
-        model = shape_inference.infer_shapes(model)
-    except Exception as exc:  # noqa: BLE001
-        print(f"  [warn] onnx shape_inference failed ({exc})")
-    graph = gs.import_onnx(model)
-
-    tp_node = _find_target_transpose(graph, target_tensor_name)
-    if tp_node.op != "Transpose":
-        print(f"  [warn] target node {tp_node.name!r} is {tp_node.op!r}, expected Transpose; proceeding anyway")
-
+def _wrap_node_with_barrier(graph, tp_node):
     in_tensor = tp_node.inputs[0]
     out_tensor = tp_node.outputs[0]
     if in_tensor.dtype is None:
@@ -125,11 +111,24 @@ def apply_trt_fusion_barrier(onnx_path, target_tensor_name):
     for i, outp in enumerate(graph.outputs):
         if outp is out_tensor:
             graph.outputs[i] = post_out
-
     graph.nodes.extend([zero_sub, pre_add, post_add])
+    return tp_node.name
+
+
+def apply_trt_fusion_barrier(onnx_path, target_tensor_name):
+    """Wrap the post-transformer permute(s) with ``Add(x, runtime_zero)`` barriers."""
+    model = onnx.load(str(onnx_path))
+    try:
+        model = shape_inference.infer_shapes(model)
+    except Exception as exc:  # noqa: BLE001
+        print(f"  [warn] onnx shape_inference failed ({exc})")
+    graph = gs.import_onnx(model)
+
+    targets = _find_target_transposes(graph, target_tensor_name)
+    wrapped = [_wrap_node_with_barrier(graph, n) for n in targets]
     graph.cleanup().toposort()
     onnx.save(gs.export_onnx(graph), str(onnx_path))
-    print(f"  wrapped {tp_node.name!r} with Add(x, runtime_zero) barriers")
+    print(f"  wrapped {wrapped} with Add(x, runtime_zero) barriers")
 
 
 def _infer_num_quantizers(onnx_path):

@@ -196,6 +196,19 @@ def parse_args():
         "which dropped the weakly-typed FP16 flag); fp32 keeps full precision (build with TF32).",
     )
     p.add_argument("--parity-batches", type=int, nargs="+", default=[1, 2], help="batch sizes to parity-check")
+    p.add_argument(
+        "--dynamic",
+        action="store_true",
+        help="Export a dynamic batch+frames graph via the dynamo exporter (no fixed F0, no "
+        "runtime pad/slice). Requires onnxscript. Builds the TRT engine with a frames profile.",
+    )
+    p.add_argument(
+        "--parity-frames",
+        type=int,
+        nargs="+",
+        default=[30, 97, 300],
+        help="frame counts to parity-check in --dynamic mode (verifies the frames axis generalizes).",
+    )
     return p.parse_args()
 
 
@@ -214,42 +227,55 @@ def main():
     nq = int(decoder.config.num_quantizers)
     codebook_size = int(decoder.config.codebook_size)
 
-    def make_dummy(batch: int) -> torch.Tensor:
-        return torch.randint(0, codebook_size, (batch, args.frames, nq), dtype=torch.long, device=device)
+    def make_dummy(batch: int, frames: int) -> torch.Tensor:
+        return torch.randint(0, codebook_size, (batch, frames, nq), dtype=torch.long, device=device)
 
-    dummy = make_dummy(args.batch_size)
     onnx_path = Path(args.onnx_path)
     onnx_path.parent.mkdir(parents=True, exist_ok=True)
-
-    with torch.inference_mode():
-        torch.onnx.export(
-            wrapper,
-            (dummy,),
-            str(onnx_path),
-            dynamo=False,
-            export_params=True,
-            opset_version=args.opset,
-            do_constant_folding=True,
-            input_names=["audio_codes"],
-            output_names=["audio_values"],
-            dynamic_axes={
-                "audio_codes": {0: "batch"},
-                "audio_values": {0: "batch"},
-            },
-        )
-    print(
-        f"ONNX exported to {onnx_path} (dtype={args.dtype}, nq={nq}, codebook_size={codebook_size}, frames=F0={args.frames})"
-    )
-
-    onnx.checker.check_model(str(onnx_path))
-
-    # Parity over batch sizes validates the dynamic batch axis (frames is fixed).
-    # Always compare against the fp32 reference so an fp16 export is checked for
-    # real accuracy loss (a looser atol for fp16).
     atol = 0.1 if args.dtype == "fp16" else 1e-3
     all_ok = True
-    for batch in args.parity_batches:
-        all_ok &= check_onnx_parity(ref_wrapper, onnx_path, make_dummy(batch), device, atol=atol)
+
+    if args.dynamic:
+        # Dynamo exporter keeps the frames axis symbolic (the integer conv-padding
+        # in the model stays a SymInt). Needs onnxscript.
+        batch_dim = torch.export.Dim("batch", min=1, max=64)
+        frames_dim = torch.export.Dim("frames", min=8, max=4096)
+        with torch.inference_mode():
+            torch.onnx.export(
+                wrapper,
+                (make_dummy(args.batch_size, args.frames),),
+                str(onnx_path),
+                dynamo=True,
+                opset_version=args.opset,
+                input_names=["audio_codes"],
+                output_names=["audio_values"],
+                dynamic_shapes={"audio_codes": {0: batch_dim, 1: frames_dim}},
+            )
+        print(f"ONNX (dynamic batch+frames) exported to {onnx_path} (dtype={args.dtype}, nq={nq})")
+        onnx.checker.check_model(str(onnx_path))
+        # Vary frames: the output length must scale (proves the frames axis generalizes).
+        for frames in args.parity_frames:
+            all_ok &= check_onnx_parity(ref_wrapper, onnx_path, make_dummy(1, frames), device, atol=atol)
+    else:
+        with torch.inference_mode():
+            torch.onnx.export(
+                wrapper,
+                (make_dummy(args.batch_size, args.frames),),
+                str(onnx_path),
+                dynamo=False,
+                export_params=True,
+                opset_version=args.opset,
+                do_constant_folding=True,
+                input_names=["audio_codes"],
+                output_names=["audio_values"],
+                dynamic_axes={"audio_codes": {0: "batch"}, "audio_values": {0: "batch"}},
+            )
+        print(f"ONNX exported to {onnx_path} (dtype={args.dtype}, nq={nq}, frames=F0={args.frames})")
+        onnx.checker.check_model(str(onnx_path))
+        # Parity over batch sizes (frames fixed). Compare vs the fp32 reference.
+        for batch in args.parity_batches:
+            all_ok &= check_onnx_parity(ref_wrapper, onnx_path, make_dummy(batch, args.frames), device, atol=atol)
+
     if not all_ok:
         raise RuntimeError("ONNX vs PyTorch parity failed - export is broken.")
 

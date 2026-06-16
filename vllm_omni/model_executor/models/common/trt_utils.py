@@ -73,7 +73,7 @@ def build_engine_from_onnx(
     *,
     profiles: dict[str, tuple[tuple, tuple, tuple]],
     strongly_typed: bool,
-    workspace_bytes: int = 1 << 32,
+    workspace_bytes: int = 1 << 33,  # 8 GiB — dynamic-shape conv tactics need headroom
 ) -> None:
     """Parse ``onnx_path`` and serialize a TensorRT engine to ``plan_path``.
 
@@ -97,10 +97,12 @@ def build_engine_from_onnx(
         # EXPLICIT_BATCH is implicit in TRT>=10; create the network with no flags.
         network = builder.create_network(0)
     parser = trt.OnnxParser(network, tlogger)
-    with open(onnx_path, "rb") as f:
-        if not parser.parse(f.read()):
-            errs = "; ".join(str(parser.get_error(i)) for i in range(parser.num_errors))
-            raise ValueError(f"Failed to parse {onnx_path}: {errs}")
+    # parse_from_file resolves external-data weights (.onnx.data) relative to the
+    # ONNX path — the dynamo exporter writes weights externally. Parsing from a
+    # bytes buffer would miss them.
+    if not parser.parse_from_file(str(onnx_path)):
+        errs = "; ".join(str(parser.get_error(i)) for i in range(parser.num_errors))
+        raise ValueError(f"Failed to parse {onnx_path}: {errs}")
 
     config = builder.create_builder_config()
     config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, workspace_bytes)

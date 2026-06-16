@@ -406,6 +406,22 @@ def _compute_pcm_hnr_db(pcm_samples: np.ndarray, sr: int = _PCM_SPEECH_SAMPLE_RA
     return float(np.mean(hnr_values)) if hnr_values else 0.0
 
 
+def compute_pcm_int16_speech_hnr_db(audio_bytes: bytes) -> float:
+    """Public HNR (dB) of raw int16 PCM. Thin wrapper over ``_compute_pcm_hnr_db``.
+
+    HNR measures *periodicity*, not intelligibility: legitimate sibilant-dense
+    speech (unvoiced fricatives are aperiodic) scores low, while buzzy or
+    repetitive output scores high. Use it only as a catastrophic-failure
+    detector (silence / white noise / sample scramble all score well below 0 dB),
+    and prefer a median across several concurrent streams to absorb per-utterance
+    sampling variance.
+    """
+    assert audio_bytes is not None and len(audio_bytes) >= 2, "missing PCM bytes"
+    assert len(audio_bytes) % 2 == 0, "PCM byte length must be aligned to int16"
+    pcm_samples = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+    return _compute_pcm_hnr_db(pcm_samples)
+
+
 def _assert_pcm_int16_speech_hnr(audio_bytes: bytes, min_hnr_db: float = _MIN_PCM_SPEECH_HNR_DB) -> None:
     """Validate harmonic-to-noise ratio on raw int16 PCM from /v1/audio/speech.
 
@@ -416,14 +432,12 @@ def _assert_pcm_int16_speech_hnr(audio_bytes: bytes, min_hnr_db: float = _MIN_PC
     request_config["min_hnr_db"] to keep the catastrophic-failure check
     while not gating CI on a model-intrinsic property.
     """
-    assert audio_bytes is not None and len(audio_bytes) >= 2, "missing PCM bytes"
-    assert len(audio_bytes) % 2 == 0, "PCM byte length must be aligned to int16"
-    pcm_samples = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
-    hnr = _compute_pcm_hnr_db(pcm_samples)
+    hnr = compute_pcm_int16_speech_hnr_db(audio_bytes)
     print(f"PCM speech HNR: {hnr:.2f} dB (threshold: {min_hnr_db} dB)")
     assert hnr >= min_hnr_db, (
         f"Audio distortion detected: HNR={hnr:.2f} dB < {min_hnr_db} dB. "
-        "Voice clone decoder may be losing ref_code speaker context on later chunks."
+        "Codec output is below the catastrophic-failure floor (silence, white "
+        "noise, and sample scramble all score well below 0 dB)."
     )
 
 

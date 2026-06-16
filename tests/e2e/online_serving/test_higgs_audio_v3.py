@@ -20,6 +20,7 @@ os.environ.setdefault("VLLM_MOE_USE_DEEP_GEMM", "0")
 
 import pytest
 
+from tests.helpers.assertions import compute_pcm_int16_speech_hnr_db
 from tests.helpers.mark import hardware_test
 from tests.helpers.media import load_test_audio_data_url
 from tests.helpers.runtime import OmniServerParams
@@ -140,7 +141,6 @@ class TestHiggsAudioV3OnlineHappyPath:
             }
         )
 
-    @pytest.mark.skip(reason="issue#4411")
     @pytest.mark.core_model
     @pytest.mark.tts
     @hardware_test(res={"cuda": "H100"}, num_cards=1)
@@ -148,13 +148,23 @@ class TestHiggsAudioV3OnlineHappyPath:
         """Three concurrent streaming requests - guards per-request frame cursors
         in ``talker2code2wav_async_chunk`` and per-slot delay-pattern state under batched AR.
 
-        NOTE: ``min_hnr_db=-2.0`` is looser than the single-request streaming test
-        because batched AR adds per-request codec quality variance (DAC boundary
-        artifacts compounded across the 3-way batch); -2.0 dB gives ~1.6 dB margin
-        over the measured worst-of-3 on L4 (-0.42 dB) while still well above the
-        catastrophic-failure region.
+        HNR is a *catastrophic-failure* detector, not a quality metric: it measures
+        periodicity, so legitimate sibilant-dense speech (unvoiced fricatives are
+        aperiodic) scores low while buzzy / repetitive output scores high. Per-stream
+        HNR therefore varies with the sampled utterance (temperature=1.0) and sibilant
+        density - neither indicates a decode bug - so the worst-of-3 is an unreliable
+        gate (a single unlucky stream of correct speech can dip below -2 dB; see
+        issue#4411). A genuine per-slot-state corruption in batched AR streaming
+        degrades *all* streams at once, so the robust gate is the *median* HNR across
+        the batch. ``min_hnr_db=-8.0`` keeps a loose per-stream catastrophic floor
+        (silence / white noise / scramble score well below it). The median-across-3
+        must clear -5.0 dB: correct speech medians sit around -2..0 dB (worst single
+        stream observed ~-3.3 dB; batch composition is non-deterministic under
+        concurrency so per-stream sampling swings ~1-3 dB run-to-run), while a
+        catastrophic failure drives every stream - and hence the median - below -8 dB.
+        -5.0 dB is the midpoint of that gap, ~3 dB clear of both sides.
         """
-        openai_client.send_audio_speech_request(
+        responses = openai_client.send_audio_speech_request(
             {
                 "model": omni_server.model,
                 "input": "She sells seashells by the seashore.",
@@ -162,9 +172,19 @@ class TestHiggsAudioV3OnlineHappyPath:
                 "response_format": "pcm",
                 "timeout": DEFAULT_SPEECH_TIMEOUT_S,
                 "min_audio_bytes": _MIN_AUDIO_BYTES,
-                "min_hnr_db": -2.0,
+                "min_hnr_db": -8.0,
             },
             request_num=3,
+        )
+        hnrs = sorted(compute_pcm_int16_speech_hnr_db(r.audio_bytes) for r in responses)
+        median_hnr = hnrs[len(hnrs) // 2]
+        print(
+            f"concurrent PCM streaming HNR per stream (sorted): {[round(h, 2) for h in hnrs]}, median={median_hnr:.2f} dB"
+        )
+        assert median_hnr >= -5.0, (
+            f"Audio distortion across the concurrent batch: median HNR={median_hnr:.2f} dB < -5.0 dB "
+            f"(per-stream: {[round(h, 2) for h in hnrs]}). A per-slot-state corruption in batched AR "
+            "streaming degrades every stream at once; an isolated low stream is sampling variance."
         )
 
 

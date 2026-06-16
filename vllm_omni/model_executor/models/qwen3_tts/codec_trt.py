@@ -29,7 +29,7 @@ import os
 import torch
 from vllm.logger import init_logger
 
-from vllm_omni.model_executor.models.common.trt_utils import (
+from .trt_utils import (
     TrtContextPool,
     build_engine_from_onnx,
     load_engine,

@@ -5,7 +5,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved
 """Build a TensorRT engine from the Qwen3-TTS codec decoder ONNX.
 
-Builds with the **Python TensorRT API** (``vllm_omni...common.trt_utils``), not
+Builds with the **Python TensorRT API** (``vllm_omni...qwen3_tts.trt_utils``), not
 ``trtexec`` — the engine must match the runtime's TRT version, and a pip-wheel
 TRT install ships no ``trtexec`` (and a system ``trtexec`` is often a different
 major version, whose serialized engine the runtime then refuses to load).
@@ -34,7 +34,7 @@ import onnx
 import onnx_graphsurgeon as gs
 from onnx import shape_inference
 
-from vllm_omni.model_executor.models.common.trt_utils import build_engine_from_onnx
+from vllm_omni.model_executor.models.qwen3_tts.trt_utils import build_engine_from_onnx
 
 
 def _make_runtime_zero(np_type, base_name):

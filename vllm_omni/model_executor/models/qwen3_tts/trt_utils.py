@@ -2,12 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved
-"""Model-agnostic TensorRT plumbing shared by the omni TTS accelerators.
+"""TensorRT engine-build / plan-cache / execution-context plumbing for the
+Qwen3-TTS codec decoder (see ``codec_trt.py``).
 
-These helpers factor out the engine-build / plan-cache / execution-context
-machinery first written for CosyVoice3 (``cosyvoice3/speaker_embedding_trt.py``
-and ``cosyvoice3/flow_estimator_trt.py``) so other models (e.g. Qwen3-TTS) can
-reuse it without importing across model packages.
+The helpers are model-agnostic (the pattern mirrors CosyVoice3's
+``speaker_embedding_trt.py`` / ``flow_estimator_trt.py``, which keep their own
+copies). They live under ``qwen3_tts/`` because that is the only current user;
+promote to a shared location if another model needs them.
 
 Precision notes (TensorRT >= 11): the weakly-typed ``BuilderFlag.FP16`` was
 dropped, so fp16 only comes from a STRONGLY_TYPED network built from an fp16

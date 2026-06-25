@@ -1,0 +1,76 @@
+# CosyVoice3 deploy — 2-GPU stage split over CudaIPCConnector.
+#
+# Same placement as cosyvoice3_2gpu.yaml (talker on GPU 0, code2wav on GPU 1,
+# one replica each) but the stage0->stage1 edge rides CudaIPCConnector instead of
+# SharedMemoryConnector. CudaIPC routes put()/get() through a per-edge SPSC ring
+# (_ipc_ring.IpcRing) with a CUDA-IPC memory pool for the big handoffs (device-to-
+# device copy, descriptor in the ring) instead of a /dev/shm round-trip per
+# transfer; small payloads ride inline in the ring, and ring-full / abort falls
+# back to /dev/shm. Goal: lower stage-to-stage handoff latency on the cross-GPU
+# edge.
+#
+# The codec streaming extras (codec_streaming / codec_chunk_frames /
+# codec_left_context_frames / codec_vocab_size) are consumed by the cosyvoice3
+# stage input processor from the connector's `extra` dict and are
+# connector-agnostic, so they carry over unchanged from the SharedMemory profile.
+#
+# Usage:
+#   CUDA_VISIBLE_DEVICES=0,1 vllm serve FunAudioLLM/Fun-CosyVoice3-0.5B-2512 \
+#     --omni --deploy-config vllm_omni/deploy/cosyvoice3_2gpu_cudaipc.yaml
+async_chunk: true
+dtype: float32
+
+connectors:
+  connector_of_cuda_ipc:
+    name: CudaIPCConnector
+    extra:
+      # --- transport (CudaIPC) ---
+      tensor_lifetime_sec: 30.0
+      pool_size_mb: 2048
+      pool_credits: 32                # slot = 2048/32 = 64MB; credits >= max_num_seqs
+      inline_threshold_bytes: 16384   # < 16KB rides inline in the ring
+      ring_body_max: 524288
+      ring_entries: 2048
+      # --- codec streaming (same as SharedMemory profile, connector-agnostic) ---
+      codec_streaming: true
+      codec_chunk_frames: 15
+      codec_left_context_frames: 25
+      codec_vocab_size: 6561
+
+stages:
+  - stage_id: 0
+    max_num_batched_tokens: 32768
+    max_num_seqs: 8
+    gpu_memory_utilization: 0.7
+    enforce_eager: false
+    trust_remote_code: true
+    enable_prefix_caching: false
+    devices: "0"
+    output_connectors:
+      to_stage_1: connector_of_cuda_ipc
+    default_sampling_params:
+      max_tokens: 2048
+      top_k: 25
+      top_p: 0.8
+      # near-identity repetition penalty forces vLLM to track
+      # output_token_ids for RAS (stop-token logit logsumexp).
+      repetition_penalty: 1.0001
+    disable_hybrid_kv_cache_manager: true
+    mm_processor_cache_gb: 0
+    skip_mm_profiling: true
+
+  - stage_id: 1
+    max_num_batched_tokens: 32768
+    max_num_seqs: 8
+    gpu_memory_utilization: 0.5
+    enforce_eager: true
+    trust_remote_code: true
+    enable_prefix_caching: false
+    max_model_len: 32768
+    devices: "1"
+    input_connectors:
+      from_stage_0: connector_of_cuda_ipc
+    default_sampling_params:
+      max_tokens: 2048
+    disable_hybrid_kv_cache_manager: true
+    skip_mm_profiling: true

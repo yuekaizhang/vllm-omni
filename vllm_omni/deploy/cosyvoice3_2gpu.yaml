@@ -1,0 +1,72 @@
+# CosyVoice3 deploy — 2-GPU stage split (talker on GPU 0, code2wav on GPU 1).
+#
+# Variant of cosyvoice3.yaml that places the two stages on separate GPUs so the
+# autoregressive talker (stage 0) and the flow-matching code2wav vocoder
+# (stage 1) no longer contend for the same SMs. code2wav decodes one request at
+# a time (the model splits the scheduled batch and runs forward_streaming with
+# batch=1 per request), so it is the serial throughput bottleneck under high
+# concurrency; giving it a dedicated GPU lets the talker keep filling the
+# pipeline while code2wav drains.
+#
+# The cross-GPU edge still rides SharedMemoryConnector (same-host shared memory,
+# stage0 GPU0 -> stage1 GPU1), exactly like qwen3_tts_high_concurrency.yaml.
+#
+# Usage:
+#   vllm serve FunAudioLLM/Fun-CosyVoice3-0.5B-2512 --omni \
+#     --deploy-config vllm_omni/deploy/cosyvoice3_2gpu.yaml
+#
+# See cosyvoice3.yaml for the single-GPU tuning notes (enforce_eager rationale,
+# streaming-continuity / GPU-class sensitivity of max_num_seqs +
+# codec_chunk_frames).
+async_chunk: true
+dtype: float32
+
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      codec_streaming: true
+      connector_get_sleep_s: 0.01
+      connector_get_max_wait_first_chunk: 3000
+      connector_get_max_wait: 300
+      codec_chunk_frames: 15
+      codec_left_context_frames: 25
+      codec_vocab_size: 6561
+
+stages:
+  - stage_id: 0
+    max_num_batched_tokens: 32768
+    max_num_seqs: 8
+    gpu_memory_utilization: 0.7
+    enforce_eager: false
+    trust_remote_code: true
+    enable_prefix_caching: false
+    devices: "0"
+    output_connectors:
+      to_stage_1: connector_of_shared_memory
+    default_sampling_params:
+      max_tokens: 2048
+      top_k: 25
+      top_p: 0.8
+      # near-identity repetition penalty forces vLLM to track
+      # output_token_ids for RAS (stop-token logit logsumexp).
+      repetition_penalty: 1.0001
+    disable_hybrid_kv_cache_manager: true
+    mm_processor_cache_gb: 0
+    skip_mm_profiling: true
+
+  - stage_id: 1
+    max_num_batched_tokens: 32768
+    max_num_seqs: 8
+    gpu_memory_utilization: 0.5
+    enforce_eager: true
+    trust_remote_code: true
+    enable_prefix_caching: false
+    max_model_len: 32768
+    devices: "1"
+    input_connectors:
+      from_stage_0: connector_of_shared_memory
+    default_sampling_params:
+      max_tokens: 2048
+    disable_hybrid_kv_cache_manager: true
+    skip_mm_profiling: true

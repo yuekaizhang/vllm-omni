@@ -33,6 +33,17 @@ models:
       voice_clone:
         task_type: Base
 
+  # CosyVoice3: voice-clone only (no built-in voices). Every request is
+  # zero-shot cloning driven by ref_audio + ref_text supplied by the seed-tts
+  # dataset, so the extra_body is empty (same shape as VoxCPM2/higgs).
+  FunAudioLLM/Fun-CosyVoice3-0.5B-2512:
+    supported_tasks: [voice_clone]
+    backend: openai-audio-speech
+    endpoint: /v1/audio/speech
+    trust_remote_code: true
+    task_extra_body:
+      voice_clone: {}
+
   bosonai/higgs-audio-v3-tts-4b:
     supported_tasks: [default_voice, voice_clone]
     backend: openai-audio-speech

@@ -1,0 +1,74 @@
+# CosyVoice3 deploy — talker on GPU 0, TWO code2wav replicas on GPU 1.
+#
+# Extends cosyvoice3_2gpu.yaml: code2wav (stage 1) is the serial bottleneck
+# because the flow-matching vocoder decodes batch=1 per request. A single
+# stage-1 worker therefore caps throughput regardless of max_num_seqs. Running
+# two code2wav replicas on GPU 1 gives the orchestrator two independent decode
+# workers to round-robin across, doubling the stage-1 decode parallelism while
+# the talker keeps the pipeline full from GPU 0.
+#
+# Replica device placement (vllm_omni/engine/stage_init_utils.py
+# split_devices_for_replicas): stage 1 has tp_size=1 and num_replicas=2, so
+# devices is read in legacy/pool mode (len == num_replicas*tp_size == 2). Each
+# entry is one replica's device, as a LOGICAL index into the launcher's
+# CUDA_VISIBLE_DEVICES. Launch with `CUDA_VISIBLE_DEVICES=0,1` so logical "1"
+# maps to physical GPU 1 → both replicas land on GPU 1.
+#
+# Usage:
+#   CUDA_VISIBLE_DEVICES=0,1 vllm serve FunAudioLLM/Fun-CosyVoice3-0.5B-2512 \
+#     --omni --deploy-config vllm_omni/deploy/cosyvoice3_2gpu_2rep.yaml
+async_chunk: true
+dtype: float32
+
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      codec_streaming: true
+      connector_get_sleep_s: 0.01
+      connector_get_max_wait_first_chunk: 3000
+      connector_get_max_wait: 300
+      codec_chunk_frames: 15
+      codec_left_context_frames: 25
+      codec_vocab_size: 6561
+
+stages:
+  - stage_id: 0
+    max_num_batched_tokens: 32768
+    max_num_seqs: 8
+    gpu_memory_utilization: 0.7
+    enforce_eager: false
+    trust_remote_code: true
+    enable_prefix_caching: false
+    devices: "0"
+    output_connectors:
+      to_stage_1: connector_of_shared_memory
+    default_sampling_params:
+      max_tokens: 2048
+      top_k: 25
+      top_p: 0.8
+      # near-identity repetition penalty forces vLLM to track
+      # output_token_ids for RAS (stop-token logit logsumexp).
+      repetition_penalty: 1.0001
+    disable_hybrid_kv_cache_manager: true
+    mm_processor_cache_gb: 0
+    skip_mm_profiling: true
+
+  - stage_id: 1
+    num_replicas: 2
+    max_num_batched_tokens: 32768
+    max_num_seqs: 8
+    gpu_memory_utilization: 0.4
+    enforce_eager: true
+    trust_remote_code: true
+    enable_prefix_caching: false
+    max_model_len: 32768
+    # Two replicas, both on logical device 1 (physical GPU 1 under
+    # CUDA_VISIBLE_DEVICES=0,1). Legacy/pool mode: one device id per replica.
+    devices: "1,1"
+    input_connectors:
+      from_stage_0: connector_of_shared_memory
+    default_sampling_params:
+      max_tokens: 2048
+    disable_hybrid_kv_cache_manager: true
+    skip_mm_profiling: true
